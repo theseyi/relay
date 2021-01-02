@@ -1,41 +1,52 @@
-// TODO: sync babel config with gulpfile. There are differences (eg, we don't
-// want to use the DEV plugin).
+/**
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ *
+ * @format
+ */
 
-var babel = require('babel-core');
-var babelPluginModules = require('fbjs/scripts/babel/rewrite-modules');
-var fs = require('fs');
-var getBabelRelayPlugin = require('../babel-relay-plugin/src/getBabelRelayPlugin');
-var objectAssign = require('object-assign');
-var path = require('path');
+'use strict';
 
-var SCHEMA_PATH = path.resolve(__dirname, 'testschema.json');
+const babel = require('@babel/core');
+const createCacheKeyFunction = require('@jest/create-cache-key-function')
+  .default;
+const getBabelOptions = require('../getBabelOptions');
+const path = require('path');
 
-var graphQLPlugin = getBabelRelayPlugin(
-  JSON.parse(fs.readFileSync(SCHEMA_PATH, 'utf8')).data
-);
-
-var babelOpts = {
-  nonStandard: true,
-  loose: [
-    'es6.classes'
+const babelOptions = getBabelOptions({
+  env: 'test',
+  // Tests use a Promise polfill so they can use jest.runAllTimers().
+  autoImport: true,
+  plugins: [
+    './dist/babel-plugin-relay',
+    '@babel/plugin-transform-flow-strip-types',
+    '@babel/plugin-transform-runtime',
+    '@babel/plugin-proposal-nullish-coalescing-operator',
+    '@babel/plugin-proposal-optional-catch-binding',
+    '@babel/plugin-proposal-optional-chaining',
+    '@babel/plugin-transform-async-to-generator',
   ],
-  stage: 1,
-  plugins: [babelPluginModules, graphQLPlugin],
-  retainLines: true,
-  _moduleMap: objectAssign({}, require('fbjs/module-map'), {
-    'crc32': 'crc32',
-    'React': 'react',
-    'ReactUpdates': 'react/lib/ReactUpdates',
-    'StaticContainer.react': 'react-static-container'
-  }),
-  extra: {
-    debug: false, // enable to debug the relay babel transform
-    documentName: 'UnknownFile'
-  },
-};
+});
 
 module.exports = {
-  process: function(src, path) {
-    return babel.transform(src, objectAssign({filename: path}, babelOpts)).code;
-  }
+  process: function(src, filename) {
+    const options = Object.assign({}, babelOptions, {
+      filename: filename,
+      retainLines: true,
+    });
+    return babel.transform(src, options).code;
+  },
+
+  getCacheKey: createCacheKeyFunction([
+    __filename,
+    // We cannot have trailing commas in this file for node < 8
+    // prettier-ignore
+    path.join(
+      path.dirname(require.resolve('babel-preset-fbjs')),
+      'package.json'
+    ),
+    path.join(__dirname, '..', 'getBabelOptions.js'),
+  ]),
 };

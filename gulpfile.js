@@ -1,162 +1,412 @@
 /**
- * Copyright 2013-2015, Facebook, Inc.
- * All rights reserved.
+ * Copyright (c) Facebook, Inc. and its affiliates.
  *
- * This source code is licensed under the BSD-style license found in the
- * LICENSE file in the root directory of this source tree. An additional grant
- * of patent rights can be found in the PATENTS file in the same directory.
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ *
+ * @format
  */
 
 'use strict';
 
-var babel = require('gulp-babel');
-var babelPluginDEV = require('fbjs/scripts/babel/dev-expression');
-var babelPluginModules = require('fbjs/scripts/babel/rewrite-modules');
-var del = require('del');
-var derequire = require('gulp-derequire');
-var envify = require('envify/custom');
-var flatten = require('gulp-flatten');
-var gulp = require('gulp');
-var gulpUtil = require('gulp-util');
-var header = require('gulp-header');
-var objectAssign = require('object-assign');
-var runSequence = require('run-sequence');
-var webpackStream = require('webpack-stream');
-
-var DEVELOPMENT_HEADER = [
-  '/**',
-  ' * Relay v<%= version %>',
-  ' */'
-].join('\n') + '\n';
-var PRODUCTION_HEADER = [
-  '/**',
-  ' * Relay v<%= version %>',
-  ' *',
-  ' * Copyright 2013-2015, Facebook, Inc.',
-  ' * All rights reserved.',
-  ' *',
-  ' * This source code is licensed under the BSD-style license found in the',
-  ' * LICENSE file in the root directory of this source tree. An additional grant',
-  ' * of patent rights can be found in the PATENTS file in the same directory.',
-  ' *',
-  ' */'
-].join('\n') + '\n';
-
-var babelOpts = {
-  nonStandard: true,
-  loose: [
-    'es6.classes'
+const babel = require('gulp-babel');
+const babelOptions = require('./scripts/getBabelOptions')({
+  ast: false,
+  plugins: [
+    '@babel/plugin-transform-flow-strip-types',
+    [
+      '@babel/plugin-transform-runtime',
+      {version: require('@babel/runtime/package.json').version},
+    ],
+    '@babel/plugin-proposal-nullish-coalescing-operator',
+    '@babel/plugin-proposal-optional-catch-binding',
+    '@babel/plugin-proposal-optional-chaining',
   ],
-  stage: 1,
-  optional: ['runtime'],
-  plugins: [babelPluginDEV, babelPluginModules],
-  _moduleMap: objectAssign({}, require('fbjs/module-map'), {
-    'crc32': 'crc32',
-    'React': 'react',
-    'StaticContainer.react': 'react-static-container'
-  })
-};
+  postPlugins: [
+    '@babel/plugin-transform-async-to-generator',
+    '@babel/plugin-transform-modules-commonjs',
+  ],
+  sourceType: 'script',
+});
+const del = require('del');
+const fs = require('fs');
+const gulp = require('gulp');
+const chmod = require('gulp-chmod');
+const gulpUtil = require('gulp-util');
+const header = require('gulp-header');
+const path = require('path');
+const rename = require('gulp-rename');
+const webpack = require('webpack');
+const webpackStream = require('webpack-stream');
 
-var buildDist = function(opts) {
-  var webpackOpts = {
-    debug: opts.debug,
-    externals: {
-      react: 'React'
-    },
-    module: {
-      loaders: [
-        {test: /\.js$/, loader: 'babel'}
-      ],
+const RELEASE_COMMIT_SHA = process.env.RELEASE_COMMIT_SHA;
+if (RELEASE_COMMIT_SHA && RELEASE_COMMIT_SHA.length !== 40) {
+  throw new Error(
+    'If the RELEASE_COMMIT_SHA env variable is set, it should be set to the ' +
+      '40 character git commit hash.',
+  );
+}
+
+const VERSION = RELEASE_COMMIT_SHA
+  ? `0.0.0-master-${RELEASE_COMMIT_SHA.substr(0, 8)}`
+  : process.env.npm_package_version;
+
+const SCRIPT_HASHBANG = '#!/usr/bin/env node\n';
+const DEVELOPMENT_HEADER = `/**
+ * Relay v${VERSION}
+ */
+`;
+const PRODUCTION_HEADER = `/**
+ * Relay v${VERSION}
+ *
+ * Copyright (c) Facebook, Inc. and its affiliates.
+ *
+ * This source code is licensed under the MIT license found in the
+ * LICENSE file in the root directory of this source tree.
+ */
+`;
+
+const buildDist = function(filename, opts, isProduction) {
+  const webpackOpts = {
+    externals: [/^[-/a-zA-Z0-9]+$/, /^@babel\/.+$/],
+    target: opts.target,
+    node: {
+      fs: 'empty',
+      net: 'empty',
+      path: 'empty',
+      child_process: 'empty',
+      util: 'empty',
     },
     output: {
-      filename: opts.output,
-      libraryTarget: 'var',
-      library: 'Relay'
+      filename: filename,
+      libraryTarget: opts.libraryTarget,
+      library: opts.libraryName,
     },
     plugins: [
       new webpackStream.webpack.DefinePlugin({
         'process.env.NODE_ENV': JSON.stringify(
-          opts.debug ? 'development' : 'production'
+          isProduction ? 'production' : 'development',
         ),
       }),
-      new webpackStream.webpack.optimize.OccurenceOrderPlugin(),
-      new webpackStream.webpack.optimize.DedupePlugin()
-    ]
+      new webpackStream.webpack.optimize.OccurrenceOrderPlugin(),
+    ],
   };
-  if (!opts.debug) {
-    webpackOpts.plugins.push(
-      new webpackStream.webpack.optimize.UglifyJsPlugin({
-        compress: {
-          hoist_vars: true,
-          screw_ie8: true,
-          warnings: false
-        }
-      })
-    );
+  if (isProduction && !opts.noMinify) {
+    // See more chunks configuration here: https://gist.github.com/sokra/1522d586b8e5c0f5072d7565c2bee693
+    webpackOpts.optimization = {
+      minimize: true,
+    };
   }
-  return webpackStream(webpackOpts, null, function(err, stats) {
+  return webpackStream(webpackOpts, webpack, function(err, stats) {
     if (err) {
       throw new gulpUtil.PluginError('webpack', err);
     }
     if (stats.compilation.errors.length) {
-      gulpUtil.log('webpack', '\n' + stats.toString({colors: true}));
+      throw new gulpUtil.PluginError('webpack', stats.toString());
     }
   });
 };
 
-var paths = {
-  dist: 'dist',
-  lib: 'lib',
-  src: [
-    '*src/**/*.js',
-    '!src/**/__tests__/**/*.js',
-    '!src/**/__mocks__/**/*.js'
-  ],
+// Paths from package-root
+const PACKAGES = 'packages';
+const DIST = 'dist';
+
+// Globs for paths in PACKAGES
+const INCLUDE_GLOBS = [
+  '**/*.js',
+  '!**/__tests__/**',
+  '!**/__flowtests__/**',
+  '!**/__mocks__/**',
+  '!**/node_modules/**',
+];
+
+const builds = [
+  {
+    package: 'babel-plugin-relay',
+    exports: {
+      index: 'BabelPluginRelay.js',
+      macro: 'BabelPluginRelay.macro.js',
+    },
+    bundles: [
+      {
+        entry: 'BabelPluginRelay.js',
+        output: 'babel-plugin-relay',
+        libraryName: 'BabelPluginRelay',
+        libraryTarget: 'commonjs2',
+        target: 'node',
+      },
+    ],
+  },
+  {
+    package: 'react-relay',
+    exports: {
+      index: 'index.js',
+      ReactRelayContext: 'ReactRelayContext.js',
+    },
+    bundles: [
+      {
+        entry: 'index.js',
+        output: 'react-relay',
+        libraryName: 'ReactRelay',
+        libraryTarget: 'umd',
+      },
+    ],
+  },
+  {
+    package: 'relay-compiler',
+    exports: {
+      index: 'index.js',
+    },
+    bundles: [
+      {
+        entry: 'index.js',
+        output: 'relay-compiler',
+        libraryName: 'RelayCompiler',
+        libraryTarget: 'commonjs2',
+        target: 'node',
+        noMinify: true, // Note: uglify can't yet handle modern JS
+      },
+    ],
+    bins: [
+      {
+        entry: 'RelayCompilerBin.js',
+        output: 'relay-compiler',
+        libraryTarget: 'commonjs2',
+        target: 'node',
+      },
+    ],
+  },
+  {
+    package: 'relay-runtime',
+    exports: {
+      index: 'index.js',
+    },
+    bundles: [
+      {
+        entry: 'index.js',
+        output: 'relay-runtime',
+        libraryName: 'RelayRuntime',
+        libraryTarget: 'umd',
+      },
+    ],
+  },
+  {
+    package: 'relay-test-utils',
+    exports: {
+      index: 'index.js',
+    },
+    bundles: [
+      {
+        entry: 'index.js',
+        output: 'relay-test-utils',
+        libraryName: 'RelayTestUtils',
+        libraryTarget: 'commonjs2',
+        target: 'node',
+        noMinify: true, // Note: uglify can't yet handle modern JS
+      },
+    ],
+  },
+  {
+    package: 'relay-config',
+    exports: {
+      index: 'index.js',
+    },
+    bundles: [
+      {
+        entry: 'index.js',
+        output: 'relay-config',
+        libraryName: 'RelayConfig',
+        target: 'node',
+        noMinify: true, // Note: uglify can't yet handle modern JS
+      },
+    ],
+  },
+  {
+    package: 'relay-test-utils-internal',
+    exports: {
+      index: 'index.js',
+    },
+    bundles: [
+      {
+        entry: 'index.js',
+        output: 'relay-test-utils-internal',
+        libraryName: 'RelayTestUtilsInternal',
+        libraryTarget: 'commonjs2',
+        target: 'node',
+        noMinify: true, // Note: uglify can't yet handle modern JS
+      },
+    ],
+  },
+];
+
+const modules = gulp.parallel(
+  ...builds.map(
+    build =>
+      function modulesTask() {
+        return gulp
+          .src(INCLUDE_GLOBS, {
+            cwd: path.join(PACKAGES, build.package),
+          })
+          .pipe(babel(babelOptions))
+          .pipe(gulp.dest(path.join(DIST, build.package, 'lib')));
+      },
+  ),
+);
+
+const flowDefs = gulp.parallel(
+  ...builds.map(
+    build =>
+      function modulesTask() {
+        return gulp
+          .src(['**/*.js', '!**/__tests__/**/*.js', '!**/__mocks__/**/*.js'], {
+            cwd: PACKAGES + '/' + build.package,
+          })
+          .pipe(rename({extname: '.js.flow'}))
+          .pipe(gulp.dest(path.join(DIST, build.package)));
+      },
+  ),
+);
+
+const copyFilesTasks = [];
+builds.forEach(build => {
+  copyFilesTasks.push(
+    function copyLicense() {
+      return gulp
+        .src(['LICENSE'])
+        .pipe(gulp.dest(path.join(DIST, build.package)));
+    },
+    function copyTestschema() {
+      return gulp
+        .src(['*.graphql'], {
+          cwd: path.join(PACKAGES, build.package),
+        })
+        .pipe(gulp.dest(path.join(DIST, build.package, 'lib')));
+    },
+    function copyPackageJSON() {
+      return gulp
+        .src(['package.json'], {
+          cwd: path.join(PACKAGES, build.package),
+        })
+        .pipe(gulp.dest(path.join(DIST, build.package)));
+    },
+  );
+});
+const copyFiles = gulp.parallel(copyFilesTasks);
+
+const exportsFiles = gulp.series(
+  copyFiles,
+  flowDefs,
+  modules,
+  gulp.parallel(
+    ...builds.map(
+      build =>
+        function exportsFilesTask(done) {
+          Object.keys(build.exports).map(exportName =>
+            fs.writeFileSync(
+              path.join(DIST, build.package, exportName + '.js'),
+              PRODUCTION_HEADER +
+                `\nmodule.exports = require('./lib/${build.exports[exportName]}');\n`,
+            ),
+          );
+          done();
+        },
+    ),
+  ),
+);
+
+const binsTasks = [];
+builds.forEach(build => {
+  if (build.bins) {
+    build.bins.forEach(bin => {
+      binsTasks.push(function binsTask() {
+        return gulp
+          .src(path.join(DIST, build.package, 'lib', 'bin', bin.entry))
+          .pipe(buildDist(bin.output, bin, /* isProduction */ false))
+          .pipe(header(SCRIPT_HASHBANG + PRODUCTION_HEADER))
+          .pipe(chmod(0o755))
+          .pipe(gulp.dest(path.join(DIST, build.package, 'bin')));
+      });
+    });
+  }
+});
+const bins = gulp.series(binsTasks);
+
+const bundlesTasks = [];
+builds.forEach(build => {
+  build.bundles.forEach(bundle => {
+    bundlesTasks.push(function bundleTask() {
+      return gulp
+        .src(path.join(DIST, build.package, 'lib', bundle.entry))
+        .pipe(
+          buildDist(bundle.output + '.js', bundle, /* isProduction */ false),
+        )
+        .pipe(header(DEVELOPMENT_HEADER))
+        .pipe(gulp.dest(path.join(DIST, build.package)));
+    });
+  });
+});
+const bundles = gulp.series(bundlesTasks);
+
+const bundlesMinTasks = [];
+builds.forEach(build => {
+  build.bundles.forEach(bundle => {
+    bundlesMinTasks.push(function bundlesMinTask() {
+      return gulp
+        .src(path.join(DIST, build.package, 'lib', bundle.entry))
+        .pipe(
+          buildDist(bundle.output + '.min.js', bundle, /* isProduction */ true),
+        )
+        .pipe(header(PRODUCTION_HEADER))
+        .pipe(gulp.dest(path.join(DIST, build.package)));
+    });
+  });
+});
+const bundlesMin = gulp.series(bundlesMinTasks);
+
+const clean = () => del(DIST);
+const dist = gulp.series(exportsFiles, bins, bundles, bundlesMin);
+const watch = gulp.series(dist, () =>
+  gulp.watch(INCLUDE_GLOBS, {cwd: PACKAGES}, dist),
+);
+
+/**
+ * Updates the package.json files `/dist/` with a version to release to npm under
+ * the master tag.
+ */
+const setMasterVersion = async () => {
+  if (!RELEASE_COMMIT_SHA) {
+    throw new Error('Expected the RELEASE_COMMIT_SHA env variable to be set.');
+  }
+  const packages = builds.map(build => build.package);
+  packages.forEach(pkg => {
+    const pkgJsonPath = path.join('.', 'dist', pkg, 'package.json');
+    const packageJson = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8'));
+    packageJson.version = VERSION;
+    for (const depKind of [
+      'dependencies',
+      'devDependencies',
+      'peerDependencies',
+    ]) {
+      const deps = packageJson[depKind];
+      for (const dep in deps) {
+        if (packages.includes(dep)) {
+          deps[dep] = VERSION;
+        }
+      }
+    }
+    fs.writeFileSync(
+      pkgJsonPath,
+      JSON.stringify(packageJson, null, 2) + '\n',
+      'utf8',
+    );
+  });
 };
 
-gulp.task('clean', function(cb) {
-  del([paths.dist, paths.lib], cb);
-});
+const cleanbuild = gulp.series(clean, dist);
 
-gulp.task('modules', function() {
-  return gulp
-    .src(paths.src)
-    .pipe(babel(babelOpts))
-    .pipe(flatten())
-    .pipe(gulp.dest(paths.lib));
-});
-
-gulp.task('dist', ['modules'], function () {
-  var distOpts = {
-    debug: true,
-    output: 'relay.js'
-  };
-  return gulp.src('./index.js')
-    .pipe(buildDist(distOpts))
-    .pipe(derequire())
-    .pipe(header(DEVELOPMENT_HEADER, {
-      version: process.env.npm_package_version
-    }))
-    .pipe(gulp.dest(paths.dist));
-});
-
-gulp.task('dist:min', ['modules'], function () {
-  var distOpts = {
-    debug: false,
-    output: 'relay.min.js'
-  };
-  return gulp.src('./index.js')
-    .pipe(buildDist(distOpts))
-    .pipe(header(PRODUCTION_HEADER, {
-      version: process.env.npm_package_version
-    }))
-    .pipe(gulp.dest(paths.dist));
-});
-
-gulp.task('watch', function() {
-  gulp.watch(paths.src, ['modules']);
-});
-
-gulp.task('default', function(cb) {
-  runSequence('clean', 'modules', ['dist', 'dist:min'], cb);
-});
+exports.clean = clean;
+exports.dist = dist;
+exports.watch = watch;
+exports.masterrelease = gulp.series(cleanbuild, setMasterVersion);
+exports.cleanbuild = cleanbuild;
+exports.default = cleanbuild;
